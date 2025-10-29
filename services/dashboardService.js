@@ -1,6 +1,6 @@
 // server/services/dashboardService.js
 
-// fallback if AI / network fails
+// -------------------- FALLBACK AI INSIGHT --------------------
 function buildInsightFallback() {
   return {
     text:
@@ -45,7 +45,7 @@ async function fetchPrices() {
   }
 }
 
-// -------------------- NEWS (filtered by user assets) --------------------
+// -------------------- NEWS HELPERS --------------------
 
 // helper: does this headline mention at least one of the user's chosen assets?
 function matchesAssets(title, assets) {
@@ -81,13 +81,34 @@ function matchesAssets(title, assets) {
   return false;
 }
 
+// -------------------- NEWS (WITH API KEY + FILTER) --------------------
 async function fetchNewsFiltered(userPrefs) {
   let base;
+
   try {
+    // pull API key from .env
+    const apiKey = process.env.CRYPTOCOMPARE_API_KEY;
     const url = "https://min-api.cryptocompare.com/data/v2/news/?lang=EN";
-    const resp = await fetch(url);
+
+    const headers = {
+      "User-Agent": "crypto-advisor-server/1.0",
+    };
+
+    // CryptoCompare now expects Authorization with `Apikey <key>`
+    if (apiKey) {
+      headers.Authorization = `Apikey ${apiKey}`;
+    }
+
+    console.log("[fetchNews] Fetching news from CryptoCompare...");
+
+    const resp = await fetch(url, { headers });
     if (!resp.ok) throw new Error("Bad response from CryptoCompare news");
+
     const data = await resp.json();
+    console.log(
+      "[fetchNews] Got news count:",
+      data?.Data?.length || 0
+    );
 
     base = (data.Data || []).map((item) => ({
       title: item.title,
@@ -96,6 +117,8 @@ async function fetchNewsFiltered(userPrefs) {
     }));
   } catch (err) {
     console.warn("⚠ fetchNewsFiltered fallback:", err.message);
+
+    // fallback mock if request fails
     base = [
       {
         title:
@@ -112,11 +135,13 @@ async function fetchNewsFiltered(userPrefs) {
     ];
   }
 
+  // filter news based on user's selected assets
   const assets = userPrefs?.cryptoAssets || [];
   const filtered = base.filter((article) =>
     matchesAssets(article.title, assets)
   );
 
+  // prefer filtered, but if nothing matched user's assets, fall back to base
   const finalList =
     filtered.length > 0 ? filtered.slice(0, 5) : base.slice(0, 5);
 
@@ -126,7 +151,7 @@ async function fetchNewsFiltered(userPrefs) {
   };
 }
 
-// -------------------- AI INSIGHT (OpenRouter) --------------------
+// -------------------- AI INSIGHT (OPENROUTER) --------------------
 async function fetchAIInsight(userPrefs) {
   if (!process.env.OPENROUTER_API_KEY) {
     return buildInsightFallback();
@@ -142,7 +167,7 @@ async function fetchAIInsight(userPrefs) {
     const riskProfile =
       userPrefs?.investorType || "a normal retail investor";
 
-    // updated prompt: force the model to only talk about chosen assets
+    // prompt tells model to ONLY talk about user's chosen assets
     const promptText = `
 You are a crypto investment assistant.
 
@@ -207,14 +232,18 @@ Rules:
 
     const data = await resp.json();
 
+    // OpenRouter-style response: choices[0].message.content
     let aiMessage = data?.choices?.[0]?.message?.content || "";
 
     aiMessage = aiMessage.trim();
+
+    // Some models wrap the JSON in ``` or ```json ... ```
     if (aiMessage.startsWith("```")) {
       aiMessage = aiMessage.replace(/^```[a-zA-Z]*\s*/, "");
       aiMessage = aiMessage.replace(/```$/, "").trim();
     }
 
+    // Try to parse final JSON
     let parsed;
     try {
       parsed = JSON.parse(aiMessage);
@@ -226,6 +255,7 @@ Rules:
       return buildInsightFallback();
     }
 
+    // Validate result shape
     if (
       !parsed.text ||
       typeof parsed.text !== "string" ||
@@ -283,10 +313,11 @@ async function getMeme() {
 async function getDashboardDataForUser(userDoc) {
   const userPrefs = userDoc.preferences || {};
 
+  // run all calls in parallel for speed
   const [pricesData, newsData, aiInsight, meme] = await Promise.all([
     fetchPrices(),
-    fetchNewsFiltered(userPrefs), // <-- now filtered by user assets
-    fetchAIInsight(userPrefs),    // <-- now AI only talks about chosen assets
+    fetchNewsFiltered(userPrefs), // filtered by user's assets
+    fetchAIInsight(userPrefs),    // AI limited to user's assets
     getMeme(),
   ]);
 
