@@ -1,10 +1,6 @@
 // server/services/dashboardService.js
 
-// Node 18+ already has global fetch, so we don't need node-fetch here.
-
-/**
- * Build fallback AI insight if the model call fails.
- */
+// fallback if AI / network fails
 function buildInsightFallback() {
   return {
     text:
@@ -14,10 +10,7 @@ function buildInsightFallback() {
   };
 }
 
-/**
- * Fetch crypto prices from CoinGecko.
- * Falls back to static mock data on failure.
- */
+// -------------------- PRICES --------------------
 async function fetchPrices() {
   try {
     const url =
@@ -52,146 +45,184 @@ async function fetchPrices() {
   }
 }
 
-/**
- * Fetch recent crypto news headlines from CryptoCompare.
- * Returns ~5 items. Falls back to static news on failure.
- */
-async function fetchNews() {
+// -------------------- NEWS (filtered by user assets) --------------------
+
+// helper: does this headline mention at least one of the user's chosen assets?
+function matchesAssets(title, assets) {
+  if (!assets || assets.length === 0) return true; // no prefs? show everything
+
+  const lower = title.toLowerCase();
+  for (const asset of assets) {
+    if (
+      asset === "BTC" &&
+      (lower.includes("btc") || lower.includes("bitcoin"))
+    ) {
+      return true;
+    }
+    if (
+      asset === "ETH" &&
+      (lower.includes("eth") || lower.includes("ethereum"))
+    ) {
+      return true;
+    }
+    if (
+      asset === "SOL" &&
+      (lower.includes("sol") || lower.includes("solana"))
+    ) {
+      return true;
+    }
+    if (
+      asset === "DOGE" &&
+      (lower.includes("doge") || lower.includes("dogecoin"))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function fetchNewsFiltered(userPrefs) {
+  let base;
   try {
     const url = "https://min-api.cryptocompare.com/data/v2/news/?lang=EN";
-
     const resp = await fetch(url);
-    if (!resp.ok) {
-      throw new Error("Bad response from CryptoCompare news");
-    }
-
+    if (!resp.ok) throw new Error("Bad response from CryptoCompare news");
     const data = await resp.json();
 
-    const top5 = (data.Data || []).slice(0, 5).map((item) => ({
+    base = (data.Data || []).map((item) => ({
       title: item.title,
       source: item.source,
       url: item.url,
     }));
-
-    return {
-      success: true,
-      news: top5,
-    };
   } catch (err) {
-    console.warn("⚠ fetchNews failed, using fallback mock:", err.message);
-
-    return {
-      success: false,
-      news: [
-        {
-          title:
-            "Bitcoin holds steady as investors await Fed comments",
-          source: "MockNews",
-          url: "https://example.com/bitcoin-steady",
-        },
-        {
-          title: "Ethereum ecosystem sees renewed DeFi activity",
-          source: "MockNews",
-          url: "https://example.com/eth-defi",
-        },
-      ],
-    };
+    console.warn("⚠ fetchNewsFiltered fallback:", err.message);
+    base = [
+      {
+        title:
+          "Bitcoin holds steady as investors await Fed comments",
+        source: "MockNews",
+        url: "https://example.com/bitcoin-steady",
+      },
+      {
+        title:
+          "Ethereum ecosystem sees renewed DeFi activity",
+        source: "MockNews",
+        url: "https://example.com/eth-defi",
+      },
+    ];
   }
+
+  const assets = userPrefs?.cryptoAssets || [];
+  const filtered = base.filter((article) =>
+    matchesAssets(article.title, assets)
+  );
+
+  const finalList =
+    filtered.length > 0 ? filtered.slice(0, 5) : base.slice(0, 5);
+
+  return {
+    success: true,
+    news: finalList,
+  };
 }
 
-/**
- * Call HF model for AI insight (personalized),
- * with fallback if no HF_API_KEY or if call fails.
- */
+// -------------------- AI INSIGHT (OpenRouter) --------------------
 async function fetchAIInsight(userPrefs) {
-  if (!process.env.HF_API_KEY) {
-    console.warn("⚠ No HF_API_KEY provided. Using fallback insight.");
+  if (!process.env.OPENROUTER_API_KEY) {
     return buildInsightFallback();
   }
 
   try {
+    const assetsList = userPrefs?.cryptoAssets || [];
     const assets =
-      (userPrefs?.cryptoAssets || []).join(", ") || "crypto assets";
-    const riskProfile =
-      userPrefs?.investorType || "general retail investor";
+      assetsList.length > 0
+        ? assetsList.join(", ")
+        : "crypto assets";
 
+    const riskProfile =
+      userPrefs?.investorType || "a normal retail investor";
+
+    // updated prompt: force the model to only talk about chosen assets
     const promptText = `
 You are a crypto investment assistant.
-User is mainly interested in: ${assets}.
-User profile: ${riskProfile}.
 
-Give one actionable crypto market insight for TODAY ONLY.
-Keep it under 80 words.
-Then provide a sentiment tag: bullish / bearish / neutral.
+User is ONLY interested in these assets: ${assets}.
+User's risk profile: ${riskProfile}.
 
-Return STRICT valid JSON only:
+Task:
+1. Give ONE actionable, short-term market insight for ONLY those assets above (ignore all other coins).
+2. Max 80 words.
+3. Add a sentiment tag: bullish / bearish / neutral (for those assets only).
+
+Return STRICT JSON ONLY in this format:
 {
   "text": "...",
   "sentiment": "..."
 }
+
+Rules:
+- Do NOT mention assets the user did not list.
+- Do NOT talk about general crypto market, only the user's coins.
+- Do NOT add explanations.
+- Do NOT add markdown.
+- Do NOT wrap the JSON in \`\`\` fences.
+- Output only raw JSON.
 `;
 
-    const HF_MODEL =
-      process.env.HF_MODEL_NAME || "tiiuae/falcon-7b-instruct";
+    const modelName =
+      process.env.OPENROUTER_MODEL || "mistralai/mistral-7b-instruct";
 
-    console.log("🔎 Calling HF model:", HF_MODEL);
-
-    const resp = await fetch(
-      `https://router.huggingface.co/hf-inference/models/${HF_MODEL}`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.HF_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          inputs: promptText,
-        }),
-      }
-    );
+    const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: modelName,
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a concise crypto market analyst. You MUST respond in valid JSON only. No markdown fences like ```.",
+          },
+          {
+            role: "user",
+            content: promptText,
+          },
+        ],
+        temperature: 0.7,
+        max_tokens: 200,
+      }),
+    });
 
     if (!resp.ok) {
       console.warn(
-        "⚠ HF response not ok:",
+        "[AI] OpenRouter response not ok:",
         resp.status,
         resp.statusText
       );
       return buildInsightFallback();
     }
 
-    const hfData = await resp.json();
-    console.log("🔎 Raw HF data:", JSON.stringify(hfData).slice(0, 500));
+    const data = await resp.json();
 
-    let rawText = "";
+    let aiMessage = data?.choices?.[0]?.message?.content || "";
 
-    if (Array.isArray(hfData) && hfData.length > 0) {
-      rawText =
-        hfData[0].generated_text ||
-        hfData[0].text ||
-        JSON.stringify(hfData[0]);
-    } else if (typeof hfData === "object" && hfData !== null) {
-      rawText =
-        hfData.generated_text ||
-        hfData.text ||
-        JSON.stringify(hfData);
-    } else {
-      rawText = String(hfData);
-    }
-
-    const match = rawText.match(/\{[\s\S]*\}/);
-    if (!match) {
-      console.warn(
-        "⚠ HF: no JSON block found. rawText begins with:",
-        rawText.slice(0, 200)
-      );
-      return buildInsightFallback();
+    aiMessage = aiMessage.trim();
+    if (aiMessage.startsWith("```")) {
+      aiMessage = aiMessage.replace(/^```[a-zA-Z]*\s*/, "");
+      aiMessage = aiMessage.replace(/```$/, "").trim();
     }
 
     let parsed;
     try {
-      parsed = JSON.parse(match[0]);
+      parsed = JSON.parse(aiMessage);
     } catch (err) {
-      console.warn("⚠ HF JSON parse error:", err.message);
+      console.warn(
+        "[AI] Failed to parse OpenRouter JSON after cleanup:",
+        err.message
+      );
       return buildInsightFallback();
     }
 
@@ -201,7 +232,7 @@ Return STRICT valid JSON only:
       !parsed.sentiment ||
       typeof parsed.sentiment !== "string"
     ) {
-      console.warn("⚠ HF JSON missing fields:", parsed);
+      console.warn("[AI] OpenRouter JSON missing fields:", parsed);
       return buildInsightFallback();
     }
 
@@ -211,27 +242,21 @@ Return STRICT valid JSON only:
       fromModel: true,
     };
   } catch (err) {
-    console.warn("⚠ fetchAIInsight failed, using fallback:", err.message);
+    console.warn("[AI] fetchAIInsight via OpenRouter failed:", err.message);
     return buildInsightFallback();
   }
 }
 
-/**
- * Fallback meme (if API fails).
- */
+// -------------------- MEME --------------------
 function buildMeme() {
   return {
-    title: "Fallback meme 😅",
-    url: "https://i.imgflip.com/30b1gx.jpg",
-    postLink: "https://imgflip.com/i/30b1gx",
-    subreddit: "memes",
+    caption:
+      "When you said 'just one more dip' and now you're 40% down 🥲",
+    imgUrl: "https://i.imgflip.com/your-crypto-meme-placeholder.jpg",
   };
 }
 
-/**
- * Fetch meme from meme-api.com, fallback if needed.
- */
-async function fetchMeme() {
+async function getMeme() {
   try {
     const resp = await fetch("https://meme-api.com/gimme");
     const data = await resp.json();
@@ -244,23 +269,25 @@ async function fetchMeme() {
     };
   } catch (err) {
     console.error("Meme API failed:", err);
-    return buildMeme();
+
+    return {
+      title: "Fallback meme 😅",
+      url: "https://i.imgflip.com/30b1gx.jpg",
+      postLink: "https://imgflip.com/i/30b1gx",
+      subreddit: "memes",
+    };
   }
 }
 
-/**
- * This is the main service function: build all dashboard data for a given user.
- * It matches exactly what the frontend expects.
- */
+// -------------------- MAIN ASSEMBLER --------------------
 async function getDashboardDataForUser(userDoc) {
-  // userDoc is a Mongo user document (or lean user)
   const userPrefs = userDoc.preferences || {};
 
   const [pricesData, newsData, aiInsight, meme] = await Promise.all([
     fetchPrices(),
-    fetchNews(),
-    fetchAIInsight(userPrefs),
-    fetchMeme(),
+    fetchNewsFiltered(userPrefs), // <-- now filtered by user assets
+    fetchAIInsight(userPrefs),    // <-- now AI only talks about chosen assets
+    getMeme(),
   ]);
 
   return {

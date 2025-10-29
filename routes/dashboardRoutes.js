@@ -1,69 +1,29 @@
 const express = require("express");
-const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const { getDashboardDataForUser } = require("../services/dashboardService");
+const auth = require("../middleware/auth");
 
 const router = express.Router();
 
 /**
- * JWT authentication middleware.
- * Extracts and verifies the Bearer token,
- * and attaches the user ID to req.userId.
- */
-function authMiddleware(req, res, next) {
-  try {
-    const authHeader = req.headers.authorization || "";
-    const token = authHeader.startsWith("Bearer ")
-      ? authHeader.replace("Bearer ", "")
-      : null;
-
-    if (!token) {
-      return res.status(401).json({ error: "No token provided" });
-    }
-
-    const decoded = jwt.verify(
-      token,
-      process.env.JWT_SECRET || "devsecret"
-    );
-
-    // We expect tokens to have shape { id: <userId> }
-    req.userId = decoded.id || decoded.userId;
-
-    if (!req.userId && !req.id) {
-      return res.status(401).json({ error: "Token is missing user id" });
-    }
-
-    next();
-  } catch (err) {
-    console.error("❌ authMiddleware error:", err.message);
-    return res.status(401).json({ error: "Invalid or expired token" });
-  }
-}
-
-/**
  * GET /dashboard
- * Returns:
- * - user info
- * - prices
- * - news
- * - aiInsight
- * - meme
- *
- * This route is now very thin: it just authenticates,
- * loads the user, and delegates the heavy lifting to the service layer.
+ * Protected route:
+ * - Requires valid JWT (auth middleware)
+ * - Loads the user from DB using req.userId
+ * - Calls service layer to assemble dashboard data
  */
-router.get("/", authMiddleware, async (req, res) => {
+router.get("/", auth, async (req, res) => {
   try {
-    // Load user from DB
+    // Load the user from Mongo by the ID we got from the token
     const user = await User.findById(req.userId).lean();
     if (!user) {
       return res.status(404).json({ error: "User not found" });
     }
 
-    // Ask the service layer to build dashboard data for this user
+    // Ask service layer for dashboard data (news, prices, AI, meme...)
     const dashboardData = await getDashboardDataForUser(user);
 
-    // Respond in the same shape the frontend already expects.
+    // Return exactly what the frontend expects
     return res.json({
       ...dashboardData,
     });
